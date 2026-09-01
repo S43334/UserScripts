@@ -1,0 +1,23 @@
+{
+  "name": "akdmic",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test fixtures/proofreading-7145.test.mjs fixtures/reorder-1212.test.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.1.1",
+      "onFail": "download"
+    }
+  },
+  "type": "module",
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}
