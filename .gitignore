@@ -1,0 +1,149 @@
+# ---------------------------------------------------------------------------
+# UserScripts — reglas de exclusión para publicación en GitHub
+#
+# Orden: primero lo que nunca debe publicarse (secretos y datos personales),
+# después ruido de herramientas. Cada bloque explica el porqué para que al
+# agregar un proyecto nuevo se sepa dónde encaja.
+# ---------------------------------------------------------------------------
+
+# === 1. Secretos y credenciales ============================================
+# Nada con claves de OAuth, tokens o cookies debe versionarse. Los archivos
+# *.example.json documentan la forma sin exponer valores.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+client_secret*.json
+*-oauth.json
+token.json
+tokens.json
+service-account*.json
+
+# Config OAuth de Google Calendar (contiene client_secret real). Ningún
+# userscript la lee; era de un backend descontinuado.
+Calendario/horario-google.json
+
+# === 2. Datos personales propios ===========================================
+# Horarios, bases de datos locales y exportaciones generadas por los scripts.
+# Son datos del usuario, no código: cada quien genera los suyos.
+Calendario/Registro-Becario-Userscript/horario_*.json
+Calendario/Registro-Becario-Userscript/calendario-db.json
+horario_*.json
+calendario-db.json
+
+# === 3. Capturas HTML con datos de terceros ================================
+# Volcados de páginas autenticadas: traen nombres, matrículas y correos
+# institucionales de otras personas. Son fixtures de diagnóstico local.
+Calendario/Registro-Becario-Userscript/html/
+oracle/estructura-html/
+akdmic/visible_tmp.txt
+
+# === 4. Material de curso con derechos de terceros =========================
+# Audio y video descargados de las plataformas: no son nuestros para
+# redistribuir. Las transcripciones .txt acompañan al medio, se excluyen igual.
+# La carpeta de fixtures completa: capturas de la plataforma, audio y las
+# suites de prueba que dependen de ellas. Se mantienen solo en local.
+akdmic/fixtures/
+akdmic/html/
+*.mp3
+*.mp4
+*.m4a
+*.wav
+
+# === 5. Capturas de horario e imagenes generadas ===========================
+# Las capturas de pantalla de horarios muestran datos de personas reales y las
+# graficas de salida se regeneran al correr el script.
+Calendario/Registro-Becario-Userscript/script-horario/*.jpg
+Calendario/Registro-Becario-Userscript/script-horario/*.jpeg
+Calendario/Registro-Becario-Userscript/script-horario/*.png
+
+# === 6. Perfiles de navegador para automatización ==========================
+# Un perfil de Edge/Chrome pesa cientos de MB y guarda cookies y sesiones
+# activas. Se regenera solo al lanzar el navegador con CDP.
+.edge-cdp-profile/
+.chrome-cdp-profile/
+*-cdp-profile/
+user-data-dir/
+
+# === 7. Node =============================================================
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+*.tsbuildinfo
+
+# === 8. Python ===========================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# === 9. Respaldos y temporales ===========================================
+# Los .bak con fecha que dejan los scripts de edición no aportan historia:
+# para eso está git.
+*.bak
+*.bak-*
+*.orig
+*.rej
+*~
+*.tmp
+*.temp
+tmp/
+temp/
+visible_tmp.txt
+
+# === 10. Sistema operativo y editores ====================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+
+# === 11. Artefactos de agentes de IA =====================================
+# Configuración local de asistentes: es del entorno, no del proyecto.
+.claude/settings.local.json
+.agents/
+.agent-todo/
+
+# === 12. Alcance mínimo: solo userscripts y sus dependencias de ejecución ==
+# Se publican únicamente los .user.js y lo que necesitan para correr (el
+# puente Node de akdmic). Documentación extendida, ejemplos, pruebas y
+# herramientas auxiliares se quedan en local.
+/package.json
+/pnpm-lock.yaml
+.gitattributes
+Calendario/README.md
+Calendario/Registro-Becario-Userscript/README.md
+Calendario/Registro-Becario-Userscript/soy-leon/README.md
+akdmic/README.md
+Calendario/horario-google.example.json
+Calendario/Registro-Becario-Userscript/horario.example.json
+Calendario/Registro-Becario-Userscript/calendario-db.example.json
+Calendario/Webassign/allowlist.test.mjs
+Calendario/Webassign/sonda-imagenes.js
+# Herramienta Python aparte (OCR de horarios), no la usa ningún userscript.
+Calendario/Registro-Becario-Userscript/script-horario/
