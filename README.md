@@ -1,6 +1,6 @@
 # UserScripts
 
-Userscripts (Tampermonkey / Violentmonkey) para automatizar tareas repetitivas
+Userscripts ([Tampermonkey](https://www.tampermonkey.net/) / [Violentmonkey](https://violentmonkey.github.io/get-it/)) para automatizar tareas repetitivas
 en plataformas académicas y web.
 
 ## Instalación
@@ -10,7 +10,7 @@ Tampermonkey o Violentmonkey (**Crear nuevo script** → pegar → guardar).
 
 | Userscript | Qué hace |
 | --- | --- |
-| [`akdmic/akdmic-bridge.user.js`](./akdmic/akdmic-bridge.user.js) | Puente WebSocket entre el navegador y un agente externo para instrumentar ejercicios de akdmic. Requiere el servidor local (ver abajo). |
+| [`akdmic/akdmic-bridge.user.js`](./akdmic/akdmic-bridge.user.js) | Puente WebSocket entre el navegador y un agente externo para instrumentar ejercicios de [akdmic](https://www.akdmic.com/). Requiere el servidor local ([ver abajo](#akdmic-servidor-puente)). |
 | [`Calendario/Registro-Becario-Userscript/extraer-horario-siu-anahuac.user.js`](./Calendario/Registro-Becario-Userscript/extraer-horario-siu-anahuac.user.js) | Extrae el horario de clases del SIU Anáhuac a JSON. |
 | [`Calendario/Registro-Becario-Userscript/registro-becario-despues-de-clases.user.js`](./Calendario/Registro-Becario-Userscript/registro-becario-despues-de-clases.user.js) | Registro de servicio becario y sincronización con Google Calendar. |
 | [`Calendario/Webassign/webassign-userscript-calendario.js`](./Calendario/Webassign/webassign-userscript-calendario.js) | Sincroniza tareas de WebAssign con Google Calendar y exporta a LaTeX/PDF. |
