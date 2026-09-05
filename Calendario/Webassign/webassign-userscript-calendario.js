@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         WebAssign → Google Calendar (Bubble Menu & Auto-Sync)
 // @namespace    https://webassign.net/
-// @version      3.18.0
+// @version      3.19.0
 // @description  Sincronización segura de WebAssign con Google Calendar y exportación local de actividades a LaTeX con imágenes, medios renderizados y frames interactivos desde la misma Bubble Menu.
 // @match        https://webassign.net/*
 // @match        https://*.webassign.net/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
@@ -226,11 +226,38 @@
   // ---------------------------------------------------------
 
   if (window.top !== window.self) {
+    installWebglCapturePatch();
     initLatexFrameBridge();
     return;
   }
 
+  installWebglCapturePatch();
   init();
+
+  // Las gráficas 3D de WebAssign dibujan en un canvas WebGL. Sin
+  // `preserveDrawingBuffer`, el backbuffer se vacía tras el composite y
+  // `canvas.toBlob()` devuelve una imagen en negro. El parche fuerza la opción
+  // en cada contexto WebGL del frame; debe instalarse en `document-start`,
+  // antes de que el graficador cree su contexto.
+  function installWebglCapturePatch() {
+    try {
+      const proto = (typeof HTMLCanvasElement === 'function') && HTMLCanvasElement.prototype;
+      if (!proto || typeof proto.getContext !== 'function' || proto.getContext.__waPatched) return;
+      const original = proto.getContext;
+      const patched = function getContext(type, attributes) {
+        if (/webgl/i.test(String(type || ''))) {
+          const merged = Object.assign({}, attributes || {}, { preserveDrawingBuffer: true });
+          return original.call(this, type, merged);
+        }
+        return original.call(this, type, attributes);
+      };
+      patched.__waPatched = true;
+      proto.getContext = patched;
+    } catch (_) {
+      // Si el navegador impide reescribir el prototipo, la captura seguirá
+      // intentándose; solo se pierde la mitigación del canvas en negro.
+    }
+  }
 
   function init() {
     if (document.readyState === 'loading') {
@@ -1627,10 +1654,25 @@
     }
   }
 
+  // WebAssign marca como `mode=display` incluso símbolos sueltos ("$f_x$") que
+  // en realidad van dentro de una frase. Emitirlos como ecuación centrada parte
+  // el párrafo y deja comas huérfanas. Solo se respeta el display cuando la
+  // fórmula lo amerita de verdad; un símbolo corto vuelve a ser inline.
+  function latexFormulaDeservesDisplay(formula) {
+    const compact = String(formula || '').replace(/\s+/g, '');
+    if (!compact) return false;
+    if (/[\n\r]|\\\\/.test(formula)) return true;
+    if (/\\(begin|frac|dfrac|tfrac|cfrac|int|iint|iiint|oint|sum|prod|lim|matrix|cases|align|split|bmatrix|pmatrix|vmatrix)\b/.test(compact)) return true;
+    if (compact.length <= 16 && !/[=<>]|\\leq|\\geq|\\neq|\\to|\\Rightarrow/.test(compact)) return false;
+    if (/[=<>]|\\leq|\\geq|\\neq/.test(compact)) return true;
+    return compact.length > 32;
+  }
+
   function latexFormulaWrapper(value, display = false) {
     const formula = normalizeLatexFormula(value);
     if (!formula) return '';
-    return display ? `\\[\n${formula}\n\\]` : `\\(${formula}\\)`;
+    const asDisplay = display && latexFormulaDeservesDisplay(formula);
+    return asDisplay ? `\\[\n${formula}\n\\]` : `\\(${formula}\\)`;
   }
 
   function getLatexImageCandidates(image) {
@@ -1854,10 +1896,22 @@
     });
   }
 
+  // No todas las gráficas interactivas de WebAssign llevan la clase `iframeGraph`
+  // (p. ej. las `surfaceAndTracesVersion*` de cálculo multivariado). Sin este
+  // reconocimiento por URL el iframe nunca se registra y la carpeta `imagenes`
+  // queda vacía en lugar de contener la captura.
+  function latexIsInteractiveGraphIframe(iframe) {
+    if (!iframe) return false;
+    if (iframe.classList.contains('iframeGraph')) return true;
+    const src = iframe.getAttribute('src') || '';
+    if (/graphingtools|graphingtool|\bgrapher|studentresponsegrapher|desmos|geogebra|\/graph(?:ing)?\b/i.test(src)) return true;
+    return Boolean(iframe.closest('.graphing-item, figure.graph, figure .graph, .int3dgraph'));
+  }
+
   function collectLatexInteractiveGraphs(article, questionNumber, context) {
     Array.from(article.querySelectorAll('iframe'))
       .filter((iframe) => (
-        iframe.classList.contains('iframeGraph')
+        latexIsInteractiveGraphIframe(iframe)
         && latexInteractiveFrameUrlAllowed(iframe.getAttribute('src') || '')
       ))
       .forEach((iframe) => {
@@ -1997,7 +2051,48 @@
     if (!control?.id) return '';
     const label = Array.from(control.closest('.input-group, .subblock, article')?.querySelectorAll('label') || [])
       .find((candidate) => candidate.htmlFor === control.id);
-    return label?.textContent.replace(/\s+/g, ' ').trim() || '';
+    if (!label) return '';
+    return latexCleanLabelText(label);
+  }
+
+  // El <label> de una respuesta suele traer la fórmula repetida hasta tres veces
+  // (render visual de MathJax, MathML asistivo y fuente `math/tex`). Tomar
+  // `.textContent` las concatenaba: "fx(1,-5,-5)=fx(1,-5,-5)=f_{x}(1,-5,-5) =:".
+  // Aquí se descartan los duplicados y se conserva solo la fuente `math/tex`.
+  function latexCleanLabelText(label) {
+    let clone;
+    try {
+      clone = label.cloneNode(true);
+    } catch (_) {
+      return String(label.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+    clone.querySelectorAll(
+      '.MathJax, .MathJax_Preview, .MathJax_Display, .MJX_Assistive_MathML, mjx-container, [aria-hidden="true"]'
+    ).forEach((node) => node.remove());
+
+    const parts = [];
+    const walk = (node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        parts.push(latexEscapeText(node.nodeValue || ''));
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const tag = node.tagName.toLowerCase();
+      const type = String(node.getAttribute('type') || '').toLowerCase();
+      if (tag === 'script') {
+        if (/^math\/tex/.test(type)) {
+          parts.push(`\\(${normalizeLatexFormula(node.textContent || '')}\\)`);
+        }
+        return;
+      }
+      Array.from(node.childNodes).forEach(walk);
+    };
+    Array.from(clone.childNodes).forEach(walk);
+
+    return parts.join('')
+      .replace(/\s+/g, ' ')
+      .replace(/\s*[:=]\s*$/, '')
+      .trim();
   }
 
   function getLatexMathTypeResponses(group) {
@@ -2018,8 +2113,19 @@
   function formatLatexResponseValue(value) {
     const text = String(value || '').trim();
     if (!text) return '\\textit{sin respuesta}';
-    if (/^<math[\s>]/i.test(text)) return `\\(${latexMathMlToTex(text)}\\)`;
-    return `\\texttt{${latexEscapeText(text)}}`;
+    if (/^<math[\s>]/i.test(text)) {
+      return `\\warespuesta{\\ensuremath{${latexMathMlToTex(text)}}}`;
+    }
+    // Respuestas numéricas o algebraicas simples: se muestran en modo
+    // matemático dentro de la caja resaltada, no en monoespaciado plano.
+    if (/[0-9]/.test(text) && /^[-+0-9.,/^*()\s a-zA-Z]+$/.test(text) && text.length <= 40) {
+      const math = text
+        .replace(/\s+/g, '')
+        .replace(/\*/g, '\\cdot ')
+        .replace(/\^(-?\d+)/g, '^{$1}');
+      return `\\warespuesta{\\ensuremath{${math}}}`;
+    }
+    return `\\warespuesta{${latexEscapeText(text)}}`;
   }
 
   function latexResponseLabel(group, index) {
@@ -2120,7 +2226,7 @@
 
   function latexRenderFigure(figure, context, mode) {
     const image = Array.from(figure.querySelectorAll('img')).find(isLatexContentImage) || null;
-    const iframe = figure.querySelector('iframe.iframeGraph');
+    const iframe = Array.from(figure.querySelectorAll('iframe')).find(latexIsInteractiveGraphIframe) || null;
     const title = latexTidy(latexSerializeChildren(
       figure.querySelector('.graph-title') || figure,
       context,
@@ -2191,24 +2297,139 @@
     const resource = context.interactiveByElement.get(iframe);
     if (resource?.captured) {
       return [
-        '\\par\\noindent',
+        '\\begin{center}',
         `\\href{${latexEscapeHref(resource.source)}}{\\includegraphics[${LATEX_EXPORT_IMAGE_OPTIONS}]{${LATEX_EXPORT_IMAGE_DIRECTORY}/${resource.fileName}}}`,
-        '\\par\\noindent\\textit{La imagen enlaza con la gr\'afica interactiva.}\\par',
+        `\\\\[2pt]{\\scriptsize\\color{anahuacGray}\\textit{Clic en la figura para abrir la gr\\'afica interactiva.}}`,
+        '\\end{center}',
       ].join('\n');
     }
 
-    return `\\par\\noindent\\textit{Gr\\'afica interactiva: }\\url{${latexEscapeUrl(source)}}\\par`;
+    return latexRenderInteractiveFallback(source);
+  }
+
+  // Sin captura del iframe, la figura 3D se reconstruye a partir de los
+  // parámetros de la URL del graficador (que llevan la superficie y sus planos
+  // de corte). Nunca se imprime la URL cruda: si no se puede reconstruir, se
+  // deja una tarjeta enlazada al graficador.
+  function latexRenderInteractiveFallback(source) {
+    const href = latexEscapeHref(source);
+    const surface = latexReconstructGrapher(source);
+    if (surface) {
+      return [
+        '\\begin{center}',
+        `\\href{${href}}{%`,
+        surface,
+        '}',
+        `\\\\[2pt]{\\scriptsize\\color{anahuacGray}\\textit{Reconstrucci\\'on de la figura; clic para abrir la gr\\'afica interactiva.}}`,
+        '\\end{center}',
+      ].join('\n');
+    }
+    return [
+      '\\begin{center}',
+      `\\href{${href}}{\\fcolorbox{anahuacOrange}{anahuacOrange!8}{\\parbox{0.86\\linewidth}{\\centering\\small`,
+      `\\textbf{Gr\\'afica interactiva 3D}\\\\[2pt]`,
+      `Clic aqu\\'i para abrirla en el graficador de WebAssign.}}}`,
+      '\\end{center}',
+    ].join('\n');
+  }
+
+  // Traduce una expresión del graficador de WebAssign (`4-x^2-y^2`, `3-x^2`) a la
+  // sintaxis de pgfplots. Es deliberadamente conservador: ante cualquier función
+  // o token que no reconoce, devuelve '' y el llamador cae a la tarjeta enlazada.
+  function latexGrapherExprToPgf(rawExpr) {
+    let expr = String(rawExpr || '').trim().toLowerCase().replace(/\s+/g, '');
+    if (!expr) return '';
+    // Enmascara `fn(` completo para que la validación no lo tome por letra
+    // suelta ni por multiplicación implícita.
+    const tokens = [];
+    expr = expr.replace(/(sqrt|sinh|cosh|tanh|asin|acos|atan|sin|cos|tan|ln|log|exp|abs)\(/g, (match) => {
+      tokens.push(match);
+      return '~' + (tokens.length - 1) + '~';
+    });
+    const bare = expr.replace(/~\d+~/g, '');
+    // Solo x/y/z, la constante e, numeros y operadores explicitos.
+    if (!/^[-+*/^().0-9xyze]+$/.test(bare)) return '';
+    // Multiplicacion implicita (2x, xy, )(, x(): pgfplots la necesita
+    // explicita y adivinarla es fragil, asi que se cae a la tarjeta enlazada.
+    if (/[0-9a-z]\(|\)[0-9a-z(]|[0-9][a-z]|[a-z][a-z]/.test(bare)) return '';
+    expr = expr.replace(/\^(-?\d+(?:\.\d+)?)/g, '^($1)');
+    tokens.forEach((fnParen, index) => {
+      expr = expr.split('~' + index + '~').join(fnParen);
+    });
+    return expr;
+  }
+
+  function latexGrapherBound(rawValue, fallback) {
+    const value = Math.abs(Number(rawValue));
+    return Number.isFinite(value) && value > 0 ? Math.min(value, 50) : fallback;
+  }
+
+  function latexGrapherTrace(plane, trace, xBound, yBound) {
+    const planeMatch = /^\s*([xy])\s*=\s*(-?\d+(?:\.\d+)?)\s*$/.exec(plane || '');
+    const traceMatch = /^\s*z\s*=\s*(.+)$/i.exec(trace || '');
+    if (!planeMatch || !traceMatch) return '';
+    const axis = planeMatch[1];
+    const constant = planeMatch[2];
+    let body = latexGrapherExprToPgf(traceMatch[1]);
+    if (!body) return '';
+    if (axis === 'y') {
+      return `\\addplot3[domain=-${xBound}:${xBound}, samples=80, samples y=0, thick, color=anahuacDark] ({x}, {${constant}}, {${body}});`;
+    }
+    body = body.replace(/y/g, 'x');
+    return `\\addplot3[domain=-${yBound}:${yBound}, samples=80, samples y=0, thick, color=anahuacDark] ({${constant}}, {x}, {${body}});`;
+  }
+
+  function latexReconstructGrapher(rawSource) {
+    let url;
+    try {
+      url = new URL(rawSource, typeof location === 'object' ? location.href : 'https://www.webassign.net/');
+    } catch (_) {
+      return '';
+    }
+    const params = url.searchParams;
+    if ((params.get('left') || 'z').toLowerCase() !== 'z') return '';
+    const surface = latexGrapherExprToPgf(params.get('right') || '');
+    if (!surface) return '';
+
+    const xBound = latexGrapherBound(params.get('xmax'), 5);
+    const yBound = latexGrapherBound(params.get('ymax'), 5);
+    const zBound = latexGrapherBound(params.get('zmax'), 5);
+
+    const traces = [];
+    for (let index = 1; index <= 9; index += 1) {
+      const line = latexGrapherTrace(params.get(`plane${index}`), params.get(`trace${index}`), xBound, yBound);
+      if (line) traces.push(line);
+    }
+
+    return [
+      '\\begin{tikzpicture}',
+      `\\begin{axis}[width=0.74\\linewidth, height=7.2cm, view={55}{26}, trig format plots=rad,`,
+      `  xlabel={$x$}, ylabel={$y$}, zlabel={$z$}, grid=both,`,
+      `  xmin=-${xBound}, xmax=${xBound}, ymin=-${yBound}, ymax=${yBound}, zmin=-${zBound}, zmax=${zBound},`,
+      `  restrict z to domain*=-${zBound}:${zBound}, enlargelimits=false,`,
+      `  tick label style={font=\\scriptsize}, label style={font=\\small}]`,
+      `\\addplot3[surf, shader=interp, opacity=0.80, z buffer=sort, samples=40, samples y=40,`,
+      `  domain=-${xBound}:${xBound}, y domain=-${yBound}:${yBound}] {${surface}};`,
+      ...traces,
+      '\\end{axis}',
+      '\\end{tikzpicture}',
+    ].join('\n');
   }
 
   function latexRenderStatus(status, mode) {
     if (mode !== 'resolved' || !status) return '';
     const parts = [];
-    if (status.status) parts.push(`Estado: ${latexEscapeText(status.status)}`);
-    if (status.scoreText) parts.push(`Puntuaci\\'on: ${latexEscapeText(status.scoreText)}`);
-    if (status.feedback) parts.push(`Retroalimentaci\\'on: ${latexEscapeText(status.feedback)}`);
+    if (status.status) {
+      parts.push(`\\textbf{Estado:} ${latexEscapeText(latexStatusWord(status.status))}`);
+    }
+    if (status.scoreText) {
+      parts.push(`\\textbf{Puntuaci\\'on:} ${latexEscapeText(status.scoreText)}`);
+    }
+    if (status.feedback) {
+      parts.push(`\\textbf{Retroalimentaci\\'on:} ${latexEscapeText(status.feedback)}`);
+    }
     if (!parts.length) return '';
-    const rendered = parts.join('. ').replace(/[.!?]+$/g, '');
-    return `\\par\\noindent\\textit{${rendered}.}\\par`;
+    return `\\begin{wafeedback}\n${parts.join(' \\\\\n')}\n\\end{wafeedback}`;
   }
 
   function latexRenderVideoLinks(videos) {
@@ -2299,16 +2520,40 @@
       .trim();
   }
 
+  function latexStatusWord(status) {
+    if (status === 'correcta') return 'Correcta';
+    if (status === 'incorrecta') return 'Incorrecta';
+    if (status === 'parcial') return 'Parcial';
+    return status || '';
+  }
+
+  function latexStatusBadge(status) {
+    if (!status) return '';
+    const score = status.scoreText ? `${latexEscapeText(status.scoreText)}~` : '';
+    if (status.status === 'correcta') return `\\wabadge{waCorrect}{${score}\\checkmark}`;
+    if (status.status === 'incorrecta') return `\\wabadge{waWrong}{${score}\\ensuremath{\\times}}`;
+    if (status.status === 'parcial') return `\\wabadge{waPartial}{${score || 'Parcial'}}`;
+    return score ? `\\wabadge{anahuacGray}{${latexEscapeText(status.scoreText)}}` : '';
+  }
+
+  function latexQuestionBoxHeader(model, mode) {
+    const title = `Problema ${model.number}`;
+    if (mode !== 'resolved') return title;
+    const badge = latexStatusBadge(model.status);
+    return badge ? `${title}\\hfill ${badge}` : title;
+  }
+
   function latexRenderQuestion(model, context, mode) {
     const body = latexTidy(latexSerializeNode(model.article, context, mode));
     const videos = latexRenderVideoLinks(model.videos);
     const state = latexRenderStatus(model.status, mode);
+    const inner = [body, videos, state].filter(Boolean).join('\n\n');
     return [
-      `\\section*{Problema ${model.number}}`,
-      body,
-      videos,
-      state,
-    ].filter(Boolean).join('\n\n');
+      `\\needspace{4\\baselineskip}`,
+      `\\begin{waproblema}{${latexQuestionBoxHeader(model, mode)}}`,
+      inner,
+      `\\end{waproblema}`,
+    ].join('\n');
   }
 
   function latexPdfMetadata(value) {
@@ -2324,15 +2569,28 @@
     return { ...LATEX_STUDENT_DEFAULTS, ...stored };
   }
 
+  // El título de página de WebAssign trae curso, CRN, profesor y periodo en una
+  // sola cadena separada por " - ". Para el encabezado y la línea de contexto
+  // basta el primer segmento (nombre del curso); el resto se conserva aparte.
+  function latexSplitCourseTitle(rawName) {
+    const full = String(rawName || 'Curso WebAssign').trim();
+    const separator = full.includes(' - ') ? ' - ' : (full.includes(' — ') ? ' — ' : '');
+    if (!separator) return { short: full, detail: '' };
+    const pieces = full.split(separator).map((piece) => piece.trim()).filter(Boolean);
+    return { short: pieces[0] || full, detail: pieces.slice(1).join(' \\textbullet{} ') };
+  }
+
   function latexDocumentPreamble(activity, mode) {
     const LATEX_STUDENT = latexStudent();
     const activityTitle = latexEscapeText(activity.name);
-    const courseName = latexEscapeText(activity.course.name || 'Curso WebAssign');
-    const modeTitle = mode === 'resolved' ? 'Estado actual' : 'Ejercicio limpio';
+    const course = latexSplitCourseTitle(activity.course.name);
+    const courseShort = latexEscapeText(course.short);
+    const courseDetail = course.detail ? latexEscapeText(course.detail) : '';
+    const modeTitle = mode === 'resolved' ? 'Registro resuelto' : 'Ejercicio en limpio';
     const pdfTitle = latexPdfMetadata(`${activity.name} --- ${modeTitle}`);
     const pdfSubject = latexPdfMetadata(activity.course.name || 'Curso WebAssign');
 
-    return String.raw`\documentclass[12pt,letterpaper]{article}
+    return String.raw`\documentclass[11pt,letterpaper]{article}
 
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
@@ -2348,25 +2606,33 @@
 \usepackage{fancyhdr}
 \usepackage{parskip}
 \usepackage{enumitem}
+\usepackage{needspace}
+\usepackage{pgfplots}
+\usepackage[most]{tcolorbox}
 \usepackage{hyperref}
 \usepackage{xurl}
 
+\pgfplotsset{compat=1.16}
+
 \geometry{
-  top=2cm,
+  top=2.2cm,
   bottom=2cm,
-  left=2.5cm,
-  right=2cm
+  left=2.3cm,
+  right=2.3cm
 }
 
 \definecolor{anahuacDark}{HTML}{5F0100}
 \definecolor{anahuacOrange}{HTML}{FF8200}
 \definecolor{anahuacGray}{HTML}{5A5A5A}
+\definecolor{waCorrect}{HTML}{2E7D32}
+\definecolor{waWrong}{HTML}{C62828}
+\definecolor{waPartial}{HTML}{B26A00}
 
 \pagestyle{fancy}
 \fancyhf{}
-\lhead{\parbox[b]{0.66\headwidth}{\raggedright\color{anahuacDark}\scriptsize\textit{${courseName}}}}
+\lhead{\parbox[b]{0.66\headwidth}{\raggedright\color{anahuacDark}\scriptsize\textit{${courseShort}}}}
 \rhead{\parbox[b]{0.28\headwidth}{\raggedleft\color{anahuacGray}\scriptsize ${LATEX_STUDENT.author}}}
-\fancyfoot[C]{\thepage}
+\fancyfoot[C]{\color{anahuacGray}\scriptsize\thepage}
 \renewcommand{\headrulewidth}{0.4pt}
 \renewcommand{\headrule}{\hbox to\headwidth{\color{anahuacOrange}\leaders\hrule height\headrulewidth\hfill}}
 \setlength{\headheight}{30pt}
@@ -2374,43 +2640,73 @@
 \setlength{\emergencystretch}{3em}
 \setstretch{1.08}
 \setcounter{secnumdepth}{0}
-\setlist{leftmargin=*,itemsep=0.2em,topsep=0.25em,parsep=0pt,partopsep=0pt}
+\setlist{leftmargin=1.2em,itemsep=0.25em,topsep=0.3em,parsep=0pt,partopsep=0pt}
 \raggedbottom
 \Urlmuskip=0mu plus 2mu\relax
 
 \hypersetup{
+  hidelinks,
   pdftitle={${pdfTitle}},
   pdfauthor={${LATEX_STUDENT.author}},
-  pdfsubject={${pdfSubject}},
-  colorlinks=true,
-  linkcolor=anahuacDark,
-  urlcolor=anahuacDark,
-  citecolor=anahuacDark
+  pdfsubject={${pdfSubject}}
 }
+
+% --- Caja de cada problema: barra naranja a la izquierda, cabecera vino con la
+%     insignia de resultado alineada a la derecha. La opcion breakable deja que
+%     un problema largo continue en la pagina siguiente sin encimarse.
+\newtcolorbox{waproblema}[1]{
+  breakable, enhanced, sharp corners=downhill,
+  colback=white, colframe=anahuacDark!30, boxrule=0.5pt, arc=2pt,
+  borderline west={2.5pt}{0pt}{anahuacOrange},
+  colbacktitle=anahuacDark, coltitle=white, fonttitle=\bfseries,
+  title={#1},
+  left=9pt, right=9pt, top=5pt, bottom=7pt,
+  before skip=9pt, after skip=9pt
+}
+
+% --- Respuesta del estudiante: destaca sobre el enunciado sin gritar.
+\newtcbox{\warespuesta}{on line, tcbox raise base, boxrule=0.4pt, arc=2pt,
+  colback=anahuacOrange!12, colframe=anahuacOrange!55,
+  left=3pt, right=3pt, top=1pt, bottom=1pt, boxsep=0pt, nobeforeafter}
+
+% --- Estado / puntuación / retroalimentación del sistema al pie del problema.
+\newtcolorbox{wafeedback}{
+  enhanced, breakable, colback=anahuacGray!8, colframe=anahuacGray!25,
+  boxrule=0.3pt, arc=1.5pt, left=7pt, right=7pt, top=4pt, bottom=4pt,
+  fontupper=\small, before skip=6pt, after skip=2pt}
+
+% --- Insignia de resultado en la cabecera de la caja.
+\newcommand{\wabadge}[2]{{\normalfont\scriptsize\setlength{\fboxsep}{2.5pt}%
+  \colorbox{#1}{\textcolor{white}{\textbf{#2}}}}}
 
 \begin{document}
 
 \thispagestyle{empty}
 
 \begin{center}
-  {\LARGE\bfseries ${activityTitle}\par}
-  \vspace{0.45em}
+  {\color{anahuacOrange}\rule{0.28\linewidth}{1.4pt}}\\[0.8em]
+  {\LARGE\bfseries\color{anahuacDark} ${activityTitle}\par}
+  \vspace{0.5em}
   {\normalsize\bfseries ${LATEX_STUDENT.author}\par}
   {\footnotesize Matr\'icula: ${LATEX_STUDENT.matricula}\par}
   {\footnotesize ${LATEX_STUDENT.career}\par}
   {\footnotesize ${LATEX_STUDENT.school}, ${LATEX_STUDENT.university}\par}
-  \vspace{0.35em}
-  {\footnotesize ${courseName} --- ${modeTitle}\par}
+  \vspace{0.4em}
+  {\footnotesize\color{anahuacGray} ${courseShort} \textbullet{} ${modeTitle}\par}` +
+      (courseDetail ? String.raw`
+  {\scriptsize\color{anahuacGray} ${courseDetail}\par}` : '') + String.raw`
+  \vspace{0.4em}
+  {\color{anahuacOrange}\rule{0.28\linewidth}{1.4pt}}
 \end{center}
 
-\newpage
+\vspace{1.1em}
 
 `;
   }
 
   function latexRenderActivity(activity, models, context, mode) {
     const sections = models.map((model) => latexRenderQuestion(model, context, mode));
-    return `${latexDocumentPreamble(activity, mode)}${sections.join('\n\n\\clearpage\n\n')}\n\n\\end{document}\n`;
+    return `${latexDocumentPreamble(activity, mode)}${sections.join('\n\n')}\n\n\\end{document}\n`;
   }
 
   // [MÓDULO 3C] Exportación LaTeX: imágenes y frames interactivos
@@ -2591,14 +2887,21 @@
           let blob;
           try {
             blob = await latexCaptureIframeDirect(resource.iframe);
-          } catch (_) {
+          } catch (directError) {
+            // Se conserva el motivo del intento directo: si el puente también
+            // falla, el diagnóstico muestra ambas causas en vez de una sola.
+            resource.directError = directError?.message || String(directError);
             blob = await latexRequestIframeCapture(resource.iframe);
           }
 
           resource.blob = latexValidateImageBlob(blob);
           resource.captured = true;
         } catch (error) {
-          resource.error = error?.message || 'No se pudo capturar la gráfica interactiva.';
+          const bridgeError = error?.message || 'No se pudo capturar la gráfica interactiva.';
+          resource.error = resource.directError && resource.directError !== bridgeError
+            ? `${bridgeError} (intento directo: ${resource.directError})`
+            : bridgeError;
+          console.warn('[WebAssign LaTeX] Captura de gráfica interactiva fallida:', resource.source, resource.error);
         }
         return resource;
       });

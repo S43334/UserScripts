@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Registro Becario + Soy León · Horarios compatibles
 // @namespace    https://registrobecariosre.netlify.app/
-// @version      2.8.9
+// @version      2.9.0
 // @description  Automatiza turnos becarios, comparte ocupación universitaria y distingue AFIs, servicio y no disponibilidad entre ambos calendarios.
 // @match        https://registrobecariosre.netlify.app/*
 // @match        https://soyleon.anahuacqro.edu.mx/eventos/facelift/calendario*
+// @match        https://soyleon.anahuacqro.edu.mx/principal/menu*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -101,10 +102,14 @@
   const DATABASE_SOURCE_IMPORT = 'import';
   const SOY_LEON_EVENTS_HOST = 'soyleon.anahuacqro.edu.mx';
   const SOY_LEON_EVENTS_PATH = '/eventos/facelift/calendario';
+  const SOY_LEON_MENU_PATH = '/principal/menu';
   const SOY_LEON_EVENTS_URL = `https://${SOY_LEON_EVENTS_HOST}${SOY_LEON_EVENTS_PATH}`;
   const SOY_LEON_ESTIMATED_DURATION_MINUTES = 90;
-  const IS_SOY_LEON_EVENTS_PAGE = location.hostname === SOY_LEON_EVENTS_HOST
+  const IS_SOY_LEON_CALENDAR_PAGE = location.hostname === SOY_LEON_EVENTS_HOST
     && location.pathname.startsWith(SOY_LEON_EVENTS_PATH);
+  const IS_SOY_LEON_MENU_PAGE = location.hostname === SOY_LEON_EVENTS_HOST
+    && location.pathname.startsWith(SOY_LEON_MENU_PATH);
+  const IS_SOY_LEON_EVENTS_PAGE = IS_SOY_LEON_CALENDAR_PAGE || IS_SOY_LEON_MENU_PAGE;
   const SOY_LEON_ROOT_ID = 'rb-soy-leon-events-root';
   const SOY_LEON_STYLES_ID = 'rb-soy-leon-events-styles';
 
@@ -608,7 +613,7 @@
   function getKnownSoyLeonEvents() {
     return (Array.isArray(calendarDatabase?.soyLeon?.events) ? calendarDatabase.soyLeon.events : [])
       .map(normalizeDatabaseEvent)
-      .filter(Boolean);
+      .filter((event) => event?.isAfi);
   }
 
   function getSlotOccupancy(dateISO, slot, schedule) {
@@ -620,12 +625,10 @@
       .filter((entry) => rangesOverlap(startMin, endMin, entry.startMin, entry.endMin));
     const services = getKnownOfficialShifts()
       .filter((entry) => entry.dateISO === dateISO && rangesOverlap(startMin, endMin, entry.startMin, entry.endMin));
-    // El naranja solo se oculta cuando existe una materia. Sí puede coexistir
-    // con servicio y con rojo porque ambos son referencias distintas.
-    const afis = classes.length
-      ? []
-      : getKnownSoyLeonEvents()
-        .filter((entry) => entry.dateISO === dateISO && entry.startMin >= startMin && entry.startMin < endMin);
+    // El AFI es una referencia independiente y debe seguir visible aunque
+    // coincida con una clase, un turno o un bloque de no disponibilidad.
+    const afis = getKnownSoyLeonEvents()
+      .filter((entry) => entry.dateISO === dateISO && entry.startMin >= startMin && entry.startMin < endMin);
     const registeredAfis = afis.filter((event) => event.isRegistered);
     return { classes, busyBlocks, services, afis, registeredAfis };
   }
@@ -1274,10 +1277,10 @@
         ...event,
         isRegistered: registeredIds.has(event.id) || event.isRegistered,
         element: cardById.get(event.id)?.element || null,
-      }));
+      })).filter((event) => event.isAfi);
     }
     soyLeonState.eventSource = 'cards';
-    return [...cardById.values()];
+    return [...cardById.values()].filter((event) => event.isAfi);
   }
 
   function extractSoyLeonRegisteredEventIds() {
@@ -1601,10 +1604,21 @@
       observedAt,
     })).filter(Boolean);
     const next = await updateCalendarDatabase((database) => {
-      const eventMap = source === 'eventsData'
-        ? new Map()
-        : new Map(database.soyLeon.events.map((event) => [event.id, event]));
-      observedEvents.forEach((event) => eventMap.set(event.id, event));
+      // El menú principal solo expone una parte de los eventos. Conservamos el
+      // conjunto ya observado y no permitimos que un botón «Inscribirme» del
+      // menú borre un «Inscrito» confirmado en el calendario completo.
+      const eventMap = new Map(database.soyLeon.events.map((event) => [event.id, event]));
+      observedEvents.forEach((event) => {
+        const previous = eventMap.get(event.id);
+        eventMap.set(event.id, {
+          ...previous,
+          ...event,
+          isAfi: Boolean(event.isAfi || previous?.isAfi),
+          isRegistered: source === 'eventsData'
+            ? event.isRegistered
+            : Boolean(event.isRegistered || previous?.isRegistered),
+        });
+      });
       return {
         ...database,
         soyLeon: {
@@ -2295,6 +2309,134 @@
     container.title = labels.join(' · ');
   }
 
+  function getKnownAfiEventsByDate() {
+    const eventsByDate = new Map();
+    getKnownSoyLeonEvents().forEach((event) => {
+      const events = eventsByDate.get(event.dateISO) || [];
+      events.push(event);
+      eventsByDate.set(event.dateISO, events);
+    });
+    eventsByDate.forEach((events) => events.sort((a, b) => (
+      a.startMin - b.startMin || a.title.localeCompare(b.title)
+    )));
+    return eventsByDate;
+  }
+
+  function getAfiMarkerLabel(events) {
+    const registeredCount = events.filter((event) => event.isRegistered).length;
+    const totalLabel = `${events.length} AFI${events.length === 1 ? '' : 's'}`;
+    if (!registeredCount) return totalLabel;
+    return `${totalLabel} · ${registeredCount} inscrito${registeredCount === 1 ? '' : 's'}`;
+  }
+
+  function getAfiMarkerTitle(events) {
+    return events
+      .map((event) => `${event.isRegistered ? 'Inscrito: ' : ''}${event.title} (${event.timeText})`)
+      .join(' · ')
+      .slice(0, 1000);
+  }
+
+  function preserveAfiMarkerTitle(element, events) {
+    if (element.dataset.rbAfiOriginalTitle === undefined) {
+      element.dataset.rbAfiOriginalTitle = element.getAttribute('title') || '';
+    }
+    const title = getAfiMarkerTitle(events);
+    element.title = title;
+    return title;
+  }
+
+  function addAfiMarkerBadge(container, events) {
+    let badge = container.querySelector(':scope > .rb-after-class-afi-day-badge');
+    if (!badge) {
+      badge = document.createElement('span');
+      container.append(badge);
+    }
+    const registered = events.some((event) => event.isRegistered);
+    badge.className = `rb-after-class-afi-day-badge${registered ? ' rb-after-class-afi-day-badge-registered' : ''}`;
+    const label = getAfiMarkerLabel(events);
+    badge.textContent = label;
+    badge.title = getAfiMarkerTitle(events);
+    badge.setAttribute('aria-label', badge.title);
+    return label;
+  }
+
+  function markRegistrationAfiDayContainer(container, events) {
+    if (!container || !events.length) return;
+    container.classList.add('rb-after-class-afi-day');
+    if (events.some((event) => event.isRegistered)) {
+      container.classList.add('rb-after-class-afi-registered-day');
+    }
+    addAfiMarkerBadge(container, events);
+    preserveAfiMarkerTitle(container, events);
+  }
+
+  function getRegistrationMonthDayISO(dayButton, period) {
+    const directDate = String(dayButton.dataset.goto || '');
+    if (isISODate(directDate)) return directDate;
+    if (!period || period.view !== 'month') return '';
+
+    const dayMatch = String(dayButton.querySelector('.num')?.textContent || '').match(/\d{1,2}/);
+    if (!dayMatch) return '';
+    const date = new Date(period.year, period.month, Number(dayMatch[0]));
+    if (date.getFullYear() !== period.year || date.getMonth() !== period.month) return '';
+    return iso(date);
+  }
+
+  function markRegistrationAfiMonthMarkers(period) {
+    if (period?.view !== 'month') return;
+    const eventsByDate = getKnownAfiEventsByDate();
+    document.querySelectorAll('#content .mday').forEach((dayButton) => {
+      const dateISO = getRegistrationMonthDayISO(dayButton, period);
+      const events = eventsByDate.get(dateISO) || [];
+      if (events.length) markRegistrationAfiDayContainer(dayButton, events);
+    });
+  }
+
+  function markRegistrationAfiPeriodMarkers(view, period) {
+    if (!period?.dates?.length) return;
+    const eventsByDate = getKnownAfiEventsByDate();
+
+    if (view === 'week') {
+      const table = document.querySelector('#content table.week');
+      if (!table) return;
+      period.dates.forEach((date) => {
+        const dateISO = iso(date);
+        const events = eventsByDate.get(dateISO) || [];
+        if (!events.length) return;
+        const columnIndex = getWeekColumnIndex(table, dateISO, period);
+        const header = columnIndex >= 0 ? table.querySelector('thead tr')?.children[columnIndex] : null;
+        if (!header) return;
+        header.classList.add('rb-after-class-afi-column');
+        if (events.some((event) => event.isRegistered)) {
+          header.classList.add('rb-after-class-afi-registered-column');
+        }
+        addAfiMarkerBadge(header, events);
+        preserveAfiMarkerTitle(header, events);
+      });
+      return;
+    }
+
+    if (view === 'day') {
+      const dateISO = iso(period.dates[0]);
+      const events = eventsByDate.get(dateISO) || [];
+      if (!events.length) return;
+      const content = document.querySelector('#content');
+      if (!content) return;
+      content.classList.add('rb-after-class-afi-day-view');
+      let banner = content.querySelector(':scope > .rb-after-class-afi-banner');
+      if (!banner) {
+        banner = document.createElement('div');
+        content.prepend(banner);
+      }
+      const label = getAfiMarkerLabel(events);
+      const title = getAfiMarkerTitle(events);
+      banner.className = `rb-after-class-afi-banner${events.some((event) => event.isRegistered) ? ' rb-after-class-afi-banner-registered' : ''}`;
+      banner.textContent = `⚑ ${label}`;
+      banner.title = title;
+      banner.setAttribute('aria-label', title);
+    }
+  }
+
   function markRegistrationSlotOccupancy(dateISO, slot, schedule) {
     const statuses = getSlotOccupancy(dateISO, slot, schedule);
     if (!statuses.classes.length && !statuses.busyBlocks.length && !statuses.services.length && !statuses.afis.length) return;
@@ -2387,6 +2529,19 @@
       }
     });
     document.querySelectorAll('.rb-after-class-occupancy-day-badge').forEach((element) => element.remove());
+    document.querySelectorAll('.rb-after-class-afi-day-badge, .rb-after-class-afi-banner').forEach((element) => element.remove());
+    document.querySelectorAll('.rb-after-class-afi-column, .rb-after-class-afi-registered-column').forEach((element) => {
+      element.classList.remove('rb-after-class-afi-column', 'rb-after-class-afi-registered-column');
+    });
+    document.querySelectorAll('#content.rb-after-class-afi-day-view').forEach((element) => {
+      element.classList.remove('rb-after-class-afi-day-view');
+    });
+    document.querySelectorAll('[data-rb-afi-original-title]').forEach((element) => {
+      const originalTitle = element.dataset.rbAfiOriginalTitle || '';
+      if (originalTitle) element.setAttribute('title', originalTitle);
+      else element.removeAttribute('title');
+      delete element.dataset.rbAfiOriginalTitle;
+    });
     document.querySelectorAll('.rb-after-class-owned-day').forEach((element) => {
       element.classList.remove('rb-after-class-owned-day');
       if (element.dataset.rbOwnedTitle) {
@@ -2620,7 +2775,9 @@
       owned: [...officialShiftState.keys].sort(),
       invalid: officialShiftState.invalid.map((record) => record.key).sort(),
       databaseRevision: calendarDatabase?.revision || 0,
-      databaseEvents: (calendarDatabase?.soyLeon?.events || []).map((event) => `${event.id}|${event.dateISO}|${event.start}`).sort(),
+      databaseEvents: (calendarDatabase?.soyLeon?.events || []).map((event) => (
+        `${event.id}|${event.dateISO}|${event.start}|${event.isAfi ? 1 : 0}|${event.isRegistered ? 1 : 0}|${event.title || ''}`
+      )).sort(),
     });
 
     if (signature === lastSignature) return;
@@ -2632,6 +2789,7 @@
     const visualSchedule = getRegistrationVisualSchedule(active.schedule);
     if (view === 'month') {
       markRegistrationMonthOccupancy(visualSchedule);
+      markRegistrationAfiMonthMarkers(period);
     } else if ((view === 'week' || view === 'day') && period?.dates?.length) {
       const slots = getSlots(view);
       period.dates.forEach((date) => {
@@ -2640,6 +2798,7 @@
           markRegistrationSlotOccupancy(dateISO, slot, visualSchedule);
         });
       });
+      markRegistrationAfiPeriodMarkers(view, period);
     }
 
     if (active.errors.length || !period || !view) {
@@ -5926,6 +6085,15 @@
         outline-offset: -3px;
         background: #ede7f8 !important;
       }
+      #content .rb-after-class-university-cell.rb-after-class-afi-cell {
+        background: linear-gradient(135deg, #fff4c2 0 70%, #fff0e6 70% 100%) !important;
+      }
+      #content .rb-after-class-university-cell.rb-after-class-afi-registered-cell {
+        background: linear-gradient(135deg, #fff4c2 0 50%, #ede7f8 50% 100%) !important;
+      }
+      #content .rb-after-class-university-cell.rb-after-class-afi-cell.rb-after-class-afi-registered-cell {
+        background: linear-gradient(135deg, #fff4c2 0 34%, #fff0e6 34% 67%, #ede7f8 67% 100%) !important;
+      }
       #content .rb-after-class-university-cell.rb-after-class-busy-cell {
         background: linear-gradient(135deg, #fff4c2 0 50%, #ffe0e0 50% 100%) !important;
       }
@@ -5985,6 +6153,24 @@
         background: #7b5fc0;
         color: #fff;
       }
+      .rb-after-class-afi-day-badge {
+        display: block;
+        max-width: 100%;
+        margin: 3px 0 0;
+        padding: 2px 5px;
+        border-radius: 5px;
+        background: #e8622a;
+        color: #fff;
+        font-size: 10px;
+        font-weight: 800;
+        line-height: 1.2;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .rb-after-class-afi-day-badge-registered {
+        background: #7b5fc0;
+      }
       #content .mday.rb-after-class-university-day {
         border-color: #c99700 !important;
         background: #fff4c2 !important;
@@ -6010,6 +6196,31 @@
       }
       #content .mday.rb-after-class-afi-day.rb-after-class-afi-registered-day {
         background: linear-gradient(135deg, #fff0e6 0 50%, #ede7f8 50% 100%) !important;
+      }
+      #content table.week th.rb-after-class-afi-column {
+        border-color: #e8622a !important;
+        background: #fff0e6 !important;
+        color: #7a3218 !important;
+      }
+      #content table.week th.rb-after-class-afi-registered-column {
+        border-color: #7b5fc0 !important;
+        background: #ede7f8 !important;
+        color: #4d397d !important;
+      }
+      #content.rb-after-class-afi-day-view .rb-after-class-afi-banner {
+        margin: 0 0 10px;
+        padding: 8px 10px;
+        border: 2px solid #e8622a;
+        border-radius: 8px;
+        background: #fff0e6;
+        color: #7a3218;
+        font-size: 12px;
+        font-weight: 800;
+      }
+      #content.rb-after-class-afi-day-view .rb-after-class-afi-banner-registered {
+        border-color: #7b5fc0;
+        background: #ede7f8;
+        color: #4d397d;
       }
       .rb-after-class-badge {
         margin: 0 0 5px;
